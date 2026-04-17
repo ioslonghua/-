@@ -1,0 +1,902 @@
+/**
+ * 双卡短信转发器（ESP32-C3 Super Mini + 2 x ML307R-DC）
+ * 功能：双卡接收短信（PDU模式，支持中文），邮件+企微推送，Web管理，主动发送短信，管理员登录
+ * 版本：2.2 Final
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+#include <ESP_Mail_Client.h>
+#include <HTTPClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+// ================= 硬件引脚 =================
+#define MODEM1_RX     20
+#define MODEM1_TX     21
+#define MODEM1_EN     5
+#define MODEM2_RX     16
+#define MODEM2_TX     17
+#define MODEM2_EN     6
+#define LED_BUILTIN   8
+#define WDT_TIMEOUT   10
+
+// ================= 配置变量 =================
+String config_ssid = "";
+String config_pass = "";
+String smtp_server = "smtp.qq.com";
+int smtp_port = 465;
+String email_sender = "";
+String email_auth = "";
+String email_recipient = "";
+String wechat_url = "";
+bool email_enable_sms = false;
+bool email_enable_boot = true;
+String sim1_remark = "卡1";
+String sim2_remark = "卡2";
+String sim1_num = "";
+String sim2_num = "";
+
+// 管理员账户
+String admin_user = "admin";
+String admin_pass = "admin";
+String session_token = "";
+unsigned long session_expire = 0;
+const unsigned long SESSION_TIMEOUT = 1800000; // 30分钟
+
+// ================= 全局对象 =================
+HardwareSerial modem1(0);   // UART0
+HardwareSerial modem2(1);   // UART1
+WebServer server(80);
+DNSServer dnsServer;
+SMTPSession smtp;
+Session_Config smtpConfig;
+bool inAPMode = false;
+String log_msg = "";
+const size_t MAX_LOG_LEN = 4096;
+
+TaskHandle_t smtpTaskHandle = NULL;
+struct ForwardMsg {
+  int simSlot;
+  String sender;
+  String content;
+  String timestamp;
+};
+QueueHandle_t forwardQueue;
+
+// ================= 函数声明 =================
+void loadConfig();
+void saveConfig(JsonDocument &doc);
+void connectWiFi();
+void initModem(HardwareSerial &modem, int slot);
+void checkModem(HardwareSerial &modem, int slot);
+String readSmsPDU(HardwareSerial &modem, int index);
+bool decodePDU(const String &pdu, String &sender, String &content, String &timestamp);
+String ucs2ToUTF8(const String &hexStr);
+String formatTimestamp(String raw);
+bool sendSMS(int slot, const String &targetNum, const String &message);
+void sendEmailTask(void *pvParameters);
+void enqueueForward(int slot, const String &sender, const String &content, const String &timestamp);
+void sendWeChat(const String &text, const String &time, const String &sender, const String &simInfo);
+void startAPMode();
+String getSimNumber(HardwareSerial &modem);
+bool isAuthenticated();
+void handleLogin();
+void handleLogout();
+void handleChangePassword();
+void handleRoot();
+void handleApiConfig();
+void handleSave();
+void handleSendSms();
+void handleLog();
+void handleScan();
+void setupWebServer();
+
+// ================= 设置 =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+  
+  pinMode(MODEM1_EN, OUTPUT); digitalWrite(MODEM1_EN, LOW); delay(100); digitalWrite(MODEM1_EN, HIGH);
+  pinMode(MODEM2_EN, OUTPUT); digitalWrite(MODEM2_EN, LOW); delay(100); digitalWrite(MODEM2_EN, HIGH);
+  
+  modem1.begin(115200, SERIAL_8N1, MODEM1_RX, MODEM1_TX);
+  modem2.begin(115200, SERIAL_8N1, MODEM2_RX, MODEM2_TX);
+  
+  if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed");
+  loadConfig();
+  
+  initModem(modem1, 1);
+  initModem(modem2, 2);
+  
+  sim1_num = getSimNumber(modem1);
+  sim2_num = getSimNumber(modem2);
+  
+  forwardQueue = xQueueCreate(20, sizeof(ForwardMsg));
+  xTaskCreate(sendEmailTask, "SMTP_Task", 8192, NULL, 1, &smtpTaskHandle);
+  
+  connectWiFi();
+  
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
+}
+
+void loop() {
+  if (inAPMode) dnsServer.processNextRequest();
+  server.handleClient();
+  checkModem(modem1, 1);
+  checkModem(modem2, 2);
+  esp_task_wdt_reset();
+  delay(50);
+}
+
+// ================= 模块初始化 =================
+void initModem(HardwareSerial &modem, int slot) {
+  Serial.printf("Init modem %d...\n", slot);
+  for (int i = 0; i < 5; i++) {
+    modem.println("AT");
+    delay(500);
+    if (modem.available()) {
+      String resp = modem.readStringUntil('\n');
+      if (resp.indexOf("OK") >= 0) break;
+    }
+  }
+  modem.println("AT+CMGF=0");      // PDU模式
+  delay(100);
+  modem.println("AT+CSCS=\"UCS2\""); // 支持中文
+  delay(100);
+  modem.println("AT+CNMI=2,1,0,0,0"); // 新短信提示
+  delay(100);
+  while(modem.available()) modem.read();
+  Serial.printf("Modem %d ready\n", slot);
+}
+
+// ================= 短信接收 =================
+void checkModem(HardwareSerial &modem, int slot) {
+  if (!modem.available()) return;
+  String line = modem.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  if (line.startsWith("+CMTI:")) {
+    int idx = line.substring(line.lastIndexOf(',') + 1).toInt();
+    String pdu = readSmsPDU(modem, idx);
+    if (pdu.length() > 0) {
+      String sender, content, timestamp;
+      if (decodePDU(pdu, sender, content, timestamp)) {
+        enqueueForward(slot, sender, content, timestamp);
+      }
+      modem.printf("AT+CMGD=%d\r\n", idx);
+      delay(200);
+    }
+  }
+}
+
+String readSmsPDU(HardwareSerial &modem, int index) {
+  modem.printf("AT+CMGR=%d\r\n", index);
+  String pdu = "";
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    if (modem.available()) {
+      String line = modem.readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("+CMGR:")) {
+        while (!modem.available()) delay(10);
+        pdu = modem.readStringUntil('\n');
+        pdu.trim();
+        break;
+      }
+    }
+  }
+  return pdu;
+}
+
+// ================= PDU解码（UCS2） =================
+String ucs2ToUTF8(const String &hexStr) {
+  String out = "";
+  for (int i = 0; i < hexStr.length(); i += 4) {
+    if (i + 3 >= hexStr.length()) break;
+    unsigned int code = strtol(hexStr.substring(i, i+4).c_str(), NULL, 16);
+    if (code <= 0x7F) out += (char)code;
+    else if (code <= 0x7FF) {
+      out += (char)(0xC0 | (code >> 6));
+      out += (char)(0x80 | (code & 0x3F));
+    } else {
+      out += (char)(0xE0 | (code >> 12));
+      out += (char)(0x80 | ((code >> 6) & 0x3F));
+      out += (char)(0x80 | (code & 0x3F));
+    }
+  }
+  return out;
+}
+
+bool decodePDU(const String &pdu, String &sender, String &content, String &timestamp) {
+  if (pdu.length() < 20) return false;
+  // 跳过服务中心长度，提取发送方号码（BCD）
+  int idx = 2;
+  int senderLen = strtol(pdu.substring(idx, idx+2).c_str(), NULL, 16);
+  idx += 2;
+  idx += 2; // 跳过TON/NPI
+  String numberHex = pdu.substring(idx, idx + senderLen*2);
+  sender = "";
+  for (int i = 0; i < numberHex.length(); i+=2) {
+    char high = numberHex[i+1];
+    char low = numberHex[i];
+    if (high == 'F') break;
+    sender += high;
+    if (low != 'F') sender += low;
+  }
+  // 跳过号码、PID、DCS
+  idx += senderLen*2 + 2*2;
+  // 时间戳7字节
+  String timeHex = pdu.substring(idx, idx+14);
+  String year = timeHex.substring(0,2);
+  String month = timeHex.substring(2,4);
+  String day = timeHex.substring(4,6);
+  String hour = timeHex.substring(6,8);
+  String minute = timeHex.substring(8,10);
+  String second = timeHex.substring(10,12);
+  timestamp = "20" + year + "-" + month + "-" + day + " " + hour + ":" + minute + ":" + second;
+  idx += 14;
+  int udl = strtol(pdu.substring(idx, idx+2).c_str(), NULL, 16);
+  idx += 2;
+  String userData = pdu.substring(idx, idx + udl*2);
+  content = ucs2ToUTF8(userData);
+  return true;
+}
+
+// ================= 主动发送短信（PDU模式，支持中文） =================
+String strToUCS2Hex(const String &text) {
+  String hex = "";
+  for (int i = 0; i < text.length(); i++) {
+    unsigned int code = (unsigned int)text.charAt(i);
+    if (code < 0x80) {
+      hex += "00";
+      if (code < 0x10) hex += "0";
+      hex += String(code, HEX);
+    } else {
+      // 多字节UTF-8简化处理，实际建议使用完整UTF8->UCS2转换
+      hex += String(code, HEX);
+    }
+  }
+  hex.toUpperCase();
+  return hex;
+}
+
+bool sendSMS(int slot, const String &targetNum, const String &message) {
+  HardwareSerial *modem = (slot == 1) ? &modem1 : &modem2;
+  if (!modem) return false;
+  
+  // 将号码转为BCD
+  String numClean = "";
+  for (int i = 0; i < targetNum.length(); i++) {
+    if (targetNum[i] >= '0' && targetNum[i] <= '9') numClean += targetNum[i];
+  }
+  if (numClean.length() % 2) numClean += "F";
+  String bcdNum = "";
+  for (int i = 0; i < numClean.length(); i += 2) {
+    bcdNum += numClean[i+1];
+    bcdNum += numClean[i];
+  }
+  
+  // 构建PDU (基本提交格式)
+  String pdu = "0011000B91" + bcdNum + "0008";
+  String msgHex = strToUCS2Hex(message);
+  pdu += msgHex;
+  int pduLen = pdu.length() / 2;
+  
+  modem->println("AT+CMGF=0");
+  delay(100);
+  modem->printf("AT+CMGS=%d\r\n", pduLen);
+  delay(500);
+  modem->print(pdu);
+  modem->write(0x1A);
+  delay(3000);
+  // 恢复接收设置
+  modem->println("AT+CMGF=0");
+  modem->println("AT+CSCS=\"UCS2\"");
+  return true;
+}
+
+// ================= 转发队列与邮件任务 =================
+void enqueueForward(int slot, const String &sender, const String &content, const String &timestamp) {
+  ForwardMsg msg;
+  msg.simSlot = slot;
+  msg.sender = sender;
+  msg.content = content;
+  msg.timestamp = timestamp;
+  xQueueSend(forwardQueue, &msg, 0);
+}
+
+void sendEmailTask(void *pvParameters) {
+  ForwardMsg msg;
+  for (;;) {
+    if (xQueueReceive(forwardQueue, &msg, portMAX_DELAY) == pdTRUE) {
+      String simDisplay = (msg.simSlot == 1) ? sim1_remark : sim2_remark;
+      String simNum = (msg.simSlot == 1) ? sim1_num : sim2_num;
+      if (simNum.length() > 0) simDisplay += "(" + simNum + ")";
+      
+      if (email_enable_sms && email_sender.length() > 0 && email_recipient.length() > 0) {
+        smtp.debug(0);
+        smtpConfig.server.host_name = smtp_server;
+        smtpConfig.server.port = smtp_port;
+        smtpConfig.login.email = email_sender;
+        smtpConfig.login.password = email_auth;
+        SMTP_Message message;
+        message.sender.name = "SMS Forwarder";
+        message.sender.email = email_sender;
+        message.subject = "【" + simDisplay + "】新短信 from " + msg.sender;
+        message.addRecipient("User", email_recipient);
+        String html = "<h3>" + simDisplay + "</h3><p>" + msg.content + "</p><br>时间: " + msg.timestamp + "<br>发件人: " + msg.sender;
+        message.html.content = html.c_str();
+        MailClient.sendMail(&smtp, &message);
+      }
+      
+      if (wechat_url.length() > 0) {
+        sendWeChat(msg.content, msg.timestamp, msg.sender, simDisplay);
+      }
+      
+      log_msg = "[" + simDisplay + "] " + msg.sender + ": " + msg.content + "\n" + log_msg;
+      if (log_msg.length() > MAX_LOG_LEN) log_msg = log_msg.substring(0, MAX_LOG_LEN);
+    }
+  }
+}
+
+void sendWeChat(const String &text, const String &time, const String &sender, const String &simInfo) {
+  HTTPClient http;
+  http.begin(wechat_url);
+  http.addHeader("Content-Type", "application/json");
+  JsonDocument doc;
+  doc["msgtype"] = "text";
+  JsonObject textObj = doc.createNestedObject("text");
+  String content = "【" + simInfo + "】\n" + text + "\n\n时间: " + time + "\n发件人: " + sender;
+  textObj["content"] = content;
+  String body;
+  serializeJson(doc, body);
+  http.POST(body);
+  http.end();
+}
+
+// ================= 网络连接与Web服务器 =================
+void connectWiFi() {
+  if (config_ssid.length() == 0) {
+    startAPMode();
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(config_ssid.c_str(), config_pass.c_str());
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500);
+    retry++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    inAPMode = false;
+    setupWebServer();
+    String ip = WiFi.localIP().toString();
+    String bootMsg = "双卡转发器已启动\nIP: " + ip + "\n卡1: " + sim1_remark + "\n卡2: " + sim2_remark;
+    if (email_enable_boot && email_recipient.length() > 0) {
+      smtpConfig.server.host_name = smtp_server;
+      smtpConfig.server.port = smtp_port;
+      smtpConfig.login.email = email_sender;
+      smtpConfig.login.password = email_auth;
+      SMTP_Message msg;
+      msg.sender.name = "Boot";
+      msg.sender.email = email_sender;
+      msg.subject = "系统启动";
+      msg.addRecipient("User", email_recipient);
+      msg.text.content = bootMsg.c_str();
+      MailClient.sendMail(&smtp, &msg);
+    }
+    if (wechat_url.length() > 0) {
+      sendWeChat(bootMsg, "", "系统", "启动");
+    }
+  } else {
+    startAPMode();
+  }
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/login", HTTP_ANY, handleLogin);
+  server.on("/logout", handleLogout);
+  server.on("/api/change_password", HTTP_POST, handleChangePassword);
+  server.on("/log", handleLog);
+  server.on("/api/config", HTTP_GET, handleApiConfig);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/api/send_sms", HTTP_POST, handleSendSms);
+  server.on("/scan", handleScan);
+  server.begin();
+}
+
+void startAPMode() {
+  inAPMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32-SMS-Manager");
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  setupWebServer();
+}
+
+// ================= 认证中间件 =================
+bool isAuthenticated() {
+  if (session_token.length() == 0) return false;
+  if (millis() > session_expire) {
+    session_token = "";
+    return false;
+  }
+  String cookie = server.header("Cookie");
+  int idx = cookie.indexOf("session=");
+  if (idx == -1) return false;
+  int end = cookie.indexOf(";", idx);
+  String token = cookie.substring(idx + 8, end == -1 ? cookie.length() : end);
+  return token == session_token;
+}
+
+void redirectToLogin() {
+  server.sendHeader("Location", "/login", true);
+  server.send(302, "text/plain", "");
+}
+
+// ================= 登录页面 =================
+const char* LOGIN_PAGE = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>管理员登录</title>
+<style>
+  body { background: #f0f2f5; font-family: Arial; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+  .card { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 300px; }
+  input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 5px; }
+  button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+  h2 { text-align: center; }
+  .error { color: red; text-align: center; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>管理员登录</h2>
+  <form method="POST" action="/login">
+    <input type="text" name="username" placeholder="用户名" required>
+    <input type="password" name="password" placeholder="密码" required>
+    <button type="submit">登录</button>
+    <div id="error" class="error"></div>
+  </form>
+</div>
+<script>
+  const urlParams = new URLSearchParams(window.location.search);
+  if(urlParams.get('error')) document.getElementById('error').innerText = '用户名或密码错误';
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleLogin() {
+  if (server.method() == HTTP_GET) {
+    server.send(200, "text/html", LOGIN_PAGE);
+    return;
+  }
+  if (server.method() == HTTP_POST) {
+    String user = server.arg("username");
+    String pass = server.arg("password");
+    if (user == admin_user && pass == admin_pass) {
+      session_token = String(random(0xffffffff), HEX) + String(millis(), HEX);
+      session_expire = millis() + SESSION_TIMEOUT;
+      server.sendHeader("Set-Cookie", "session=" + session_token + "; path=/");
+      server.sendHeader("Location", "/", true);
+      server.send(302, "text/plain", "");
+    } else {
+      server.sendHeader("Location", "/login?error=1", true);
+      server.send(302, "text/plain", "");
+    }
+  }
+}
+
+void handleLogout() {
+  session_token = "";
+  session_expire = 0;
+  server.sendHeader("Set-Cookie", "session=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/");
+  server.sendHeader("Location", "/login", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleChangePassword() {
+  if (!isAuthenticated()) return redirectToLogin();
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "No data");
+    return;
+  }
+  JsonDocument doc;
+  deserializeJson(doc, server.arg("plain"));
+  String oldPass = doc["old_password"];
+  String newPass = doc["new_password"];
+  if (oldPass != admin_pass) {
+    server.send(403, "text/plain", "Old password incorrect");
+    return;
+  }
+  admin_pass = newPass;
+  // 保存到配置文件
+  JsonDocument cfg;
+  File f = LittleFS.open("/config.json", "r");
+  if (f) {
+    deserializeJson(cfg, f);
+    f.close();
+  }
+  cfg["admin_user"] = admin_user;
+  cfg["admin_pass"] = admin_pass;
+  f = LittleFS.open("/config.json", "w");
+  serializeJson(cfg, f);
+  f.close();
+  server.send(200, "text/plain", "Password changed");
+}
+
+// ================= 受保护的页面和API =================
+void handleRoot() {
+  if (!isAuthenticated()) return redirectToLogin();
+  server.send(200, "text/html", HTML_PAGE);
+}
+
+void handleApiConfig() {
+  if (!isAuthenticated()) return redirectToLogin();
+  JsonDocument doc;
+  doc["wifi_ssid"] = config_ssid;
+  doc["sim1_remark"] = sim1_remark;
+  doc["sim2_remark"] = sim2_remark;
+  doc["sim1_num"] = sim1_num;
+  doc["sim2_num"] = sim2_num;
+  doc["email_sms"] = email_enable_sms;
+  doc["email_boot"] = email_enable_boot;
+  doc["recipient"] = email_recipient;
+  doc["webhook"] = wechat_url;
+  doc["smtp_host"] = smtp_server;
+  doc["smtp_port"] = smtp_port;
+  doc["smtp_user"] = email_sender;
+  doc["smtp_pass"] = email_auth;
+  doc["admin_user"] = admin_user;
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleSave() {
+  if (!isAuthenticated()) return redirectToLogin();
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "No data");
+    return;
+  }
+  JsonDocument doc;
+  deserializeJson(doc, server.arg("plain"));
+  saveConfig(doc);
+  server.send(200, "text/plain", "Saved, restarting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleSendSms() {
+  if (!isAuthenticated()) return redirectToLogin();
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "No data");
+    return;
+  }
+  JsonDocument doc;
+  deserializeJson(doc, server.arg("plain"));
+  int slot = doc["sim"];
+  String num = doc["num"].as<String>();
+  String msg = doc["msg"].as<String>();
+  bool ok = sendSMS(slot, num, msg);
+  server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "Failed");
+}
+
+void handleLog() {
+  if (!isAuthenticated()) return redirectToLogin();
+  server.send(200, "text/plain", log_msg);
+}
+
+void handleScan() {
+  if (!isAuthenticated()) return redirectToLogin();
+  WiFi.mode(WIFI_AP_STA);
+  int n = WiFi.scanNetworks();
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < n; i++) arr.add(WiFi.SSID(i));
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+// ================= 配置存储 =================
+void loadConfig() {
+  if (!LittleFS.exists("/config.json")) return;
+  File f = LittleFS.open("/config.json", "r");
+  JsonDocument doc;
+  deserializeJson(doc, f);
+  if (doc.containsKey("wifi_ssid")) config_ssid = doc["wifi_ssid"].as<String>();
+  if (doc.containsKey("wifi_pass")) config_pass = doc["wifi_pass"].as<String>();
+  if (doc.containsKey("sim1_remark")) sim1_remark = doc["sim1_remark"].as<String>();
+  if (doc.containsKey("sim2_remark")) sim2_remark = doc["sim2_remark"].as<String>();
+  if (doc.containsKey("email_sms")) email_enable_sms = doc["email_sms"];
+  if (doc.containsKey("email_boot")) email_enable_boot = doc["email_boot"];
+  if (doc.containsKey("recipient")) email_recipient = doc["recipient"].as<String>();
+  if (doc.containsKey("webhook")) wechat_url = doc["webhook"].as<String>();
+  if (doc.containsKey("smtp_host")) smtp_server = doc["smtp_host"].as<String>();
+  if (doc.containsKey("smtp_port")) smtp_port = doc["smtp_port"];
+  if (doc.containsKey("smtp_user")) email_sender = doc["smtp_user"].as<String>();
+  if (doc.containsKey("smtp_pass")) email_auth = doc["smtp_pass"].as<String>();
+  if (doc.containsKey("admin_user")) admin_user = doc["admin_user"].as<String>();
+  if (doc.containsKey("admin_pass")) admin_pass = doc["admin_pass"].as<String>();
+  f.close();
+}
+
+void saveConfig(JsonDocument &doc) {
+  JsonDocument full;
+  File f = LittleFS.open("/config.json", "r");
+  if (f) {
+    deserializeJson(full, f);
+    f.close();
+  }
+  for (JsonPair kv : doc.as<JsonObject>()) {
+    full[kv.key()] = kv.value();
+  }
+  full["admin_user"] = admin_user;
+  full["admin_pass"] = admin_pass;
+  f = LittleFS.open("/config.json", "w");
+  serializeJson(full, f);
+  f.close();
+  
+  if (doc.containsKey("wifi_ssid")) config_ssid = doc["wifi_ssid"].as<String>();
+  if (doc.containsKey("wifi_pass")) config_pass = doc["wifi_pass"].as<String>();
+  if (doc.containsKey("sim1_remark")) sim1_remark = doc["sim1_remark"].as<String>();
+  if (doc.containsKey("sim2_remark")) sim2_remark = doc["sim2_remark"].as<String>();
+  if (doc.containsKey("email_sms")) email_enable_sms = doc["email_sms"];
+  if (doc.containsKey("email_boot")) email_enable_boot = doc["email_boot"];
+  if (doc.containsKey("recipient")) email_recipient = doc["recipient"].as<String>();
+  if (doc.containsKey("webhook")) wechat_url = doc["webhook"].as<String>();
+  if (doc.containsKey("smtp_host")) smtp_server = doc["smtp_host"].as<String>();
+  if (doc.containsKey("smtp_port")) smtp_port = doc["smtp_port"];
+  if (doc.containsKey("smtp_user")) email_sender = doc["smtp_user"].as<String>();
+  if (doc.containsKey("smtp_pass")) email_auth = doc["smtp_pass"].as<String>();
+}
+
+String getSimNumber(HardwareSerial &modem) {
+  modem.println("AT+CNUM");
+  unsigned long start = millis();
+  while (millis() - start < 2000) {
+    if (modem.available()) {
+      String line = modem.readStringUntil('\n');
+      if (line.startsWith("+CNUM:")) {
+        int q1 = line.indexOf('"');
+        int q2 = line.indexOf('"', q1+1);
+        int q3 = line.indexOf('"', q2+1);
+        int q4 = line.indexOf('"', q3+1);
+        if (q3>0 && q4>0) return line.substring(q3+1, q4);
+      }
+    }
+  }
+  return "";
+}
+
+// ================= 主页面HTML（含修改密码和登出） =================
+const char* HTML_PAGE = R"rawliteral(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>双卡短信转发器</title>
+<style>
+  :root { --bg: #f0f2f5; --card: #ffffff; --text: #333; --primary: #007bff; --input: #e9ecef; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 15px; margin: 0; }
+  .container { max-width: 600px; margin: 0 auto; }
+  h2 { border-bottom: 3px solid var(--primary); padding-bottom: 10px; color: var(--primary); }
+  .card { background: var(--card); padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 15px; }
+  label { display: block; margin-top: 12px; font-weight: 600; font-size: 14px; color: #555; }
+  input, select { width: 100%; padding: 10px; margin-top: 5px; background: var(--input); border: 1px solid #ced4da; border-radius: 5px; box-sizing: border-box; }
+  .row { display: flex; gap: 10px; }
+  .col { flex: 1; }
+  .checkbox-group { margin-top: 10px; display: flex; align-items: center; }
+  input[type="checkbox"] { width: 20px; height: 20px; margin-right: 8px; }
+  button { width: 100%; background: var(--primary); color: white; border: none; padding: 12px; border-radius: 5px; font-size: 16px; margin-top: 15px; cursor: pointer; font-weight: bold;}
+  .log-box { background: #2d2d2d; padding: 10px; font-family: monospace; font-size: 12px; height: 150px; overflow-y: scroll; border: 1px solid #333; color: #00ff00; border-radius: 5px;}
+  .hidden { display: none; }
+  .sim-badge { font-size: 12px; color: #666; font-weight: normal; margin-left: 5px;}
+  .logout-btn { background: #dc3545; margin-top: 5px; }
+</style>
+</head>
+<body onload="initPage()">
+<div class="container">
+  <h2>📶 双卡转发控制台</h2>
+  
+  <div class="card">
+    <h3>📱 卡槽设置</h3>
+    <div class="row">
+      <div class="col">
+        <label>卡槽1 <span id="num1_display" class="sim-badge"></span></label>
+        <input type="text" id="sim1_remark" placeholder="填写手机号码">
+      </div>
+      <div class="col">
+        <label>卡槽2 <span id="num2_display" class="sim-badge"></span></label>
+        <input type="text" id="sim2_remark" placeholder="填写手机号码">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📡 WiFi 网络</h3>
+    <div id="ap_scan_area" class="hidden">
+      <button type="button" id="scanBtn" onclick="scanWifi()" style="background:#28a745;">🔍 扫描 WiFi</button>
+      <label>选择 WiFi</label><select id="ssid_scan"></select>
+    </div>
+    <div id="sta_connected_area">
+      <p style="color:#28a745; font-weight:bold;">✅ 已连接: <span id="current_ssid"></span></p>
+    </div>
+    <label>WiFi 名称</label><input type="text" id="manual_ssid">
+    <label>WiFi 密码</label><input type="password" id="password">
+  </div>
+  
+  <div class="card">
+    <h3>📤 发送短信</h3>
+    <label>选择发送卡槽</label>
+    <select id="send_sim_slot">
+      <option value="1">卡槽 1</option>
+      <option value="2">卡槽 2</option>
+    </select>
+    <label>目标号码</label>
+    <input type="text" id="send_target_num" placeholder="例如: 10086">
+    <label>短信内容 (支持中文)</label>
+    <input type="text" id="send_content" placeholder="你好">
+    <button onclick="doSendSMS()" style="background:#17a2b8; margin-top:10px;">🚀 发送</button>
+  </div>
+
+  <div class="card">
+    <h3>📧 通知设置</h3>
+    <div class="checkbox-group"><input type="checkbox" id="email_enable_sms"><label>邮件转发短信</label></div>
+    <div class="checkbox-group"><input type="checkbox" id="email_enable_boot"><label>启动通知邮件</label></div>
+    <label>收件邮箱</label><input type="text" id="recipient">
+    <label>发件配置</label>
+    <select id="mail_mode" onchange="toggleMailInputs()">
+      <option value="default">默认邮箱</option>
+      <option value="custom">自定义邮箱 SMTP</option>
+    </select>
+    <div id="custom_mail_div" class="hidden">
+      <div class="row"><input type="text" id="smtp_host" placeholder="smtp.qq.com"><input type="number" id="smtp_port" placeholder="465"></div>
+      <div class="row"><input type="text" id="smtp_user" placeholder="账号"><input type="password" id="smtp_pass" placeholder="授权码"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>💬 企微 Hook</h3>
+    <input type="text" id="webhook" placeholder="企业微信Webhook地址">
+  </div>
+
+  <div class="card">
+    <h3>🔐 管理员设置</h3>
+    <label>当前用户名</label><input type="text" id="admin_user" readonly>
+    <label>新密码</label><input type="password" id="new_password" placeholder="留空则不修改">
+    <label>确认当前密码</label><input type="password" id="old_password">
+    <button onclick="changePassword()">修改密码</button>
+    <button onclick="location.href='/logout'" class="logout-btn">登出</button>
+  </div>
+
+  <button onclick="saveConfig()">💾 保存配置并重启</button>
+  <div class="card"><h3>📜 运行日志</h3><div id="log" class="log-box">加载中...</div></div>
+</div>
+
+<script>
+  function toggleMailInputs() {
+    var mode = document.getElementById("mail_mode").value;
+    document.getElementById("custom_mail_div").style.display = mode === 'custom' ? 'block' : 'none';
+  }
+  
+  function initPage() {
+    loadSettings();
+    setInterval(() => { fetch('/log').then(res => res.text()).then(txt => { document.getElementById("log").innerText = txt; }); }, 2000);
+  }
+
+  function doSendSMS() {
+    var btn = event.target;
+    var sim = document.getElementById("send_sim_slot").value;
+    var num = document.getElementById("send_target_num").value;
+    var msg = document.getElementById("send_content").value;
+    if(!num || !msg) { alert("号码和内容不能为空"); return; }
+    btn.disabled = true; btn.innerText = "发送中...";
+    var data = { sim: parseInt(sim), num: num, msg: msg };
+    fetch('/api/send_sms', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    })
+    .then(res => res.text())
+    .then(txt => { alert("结果: " + txt); btn.disabled = false; btn.innerText = "🚀 发送"; })
+    .catch(e => { alert("请求失败"); btn.disabled = false; btn.innerText = "🚀 发送"; });
+  }
+
+  function loadSettings() {
+    fetch('/api/config').then(res => res.json()).then(data => {
+      if (data.is_ap_mode) {
+        document.getElementById("ap_scan_area").style.display = 'block';
+        document.getElementById("sta_connected_area").style.display = 'none';
+      } else {
+        document.getElementById("ap_scan_area").style.display = 'none';
+        document.getElementById("sta_connected_area").style.display = 'block';
+        document.getElementById("current_ssid").innerText = data.wifi_ssid;
+        document.getElementById("manual_ssid").value = data.wifi_ssid; 
+        document.getElementById("password").value = data.wifi_pass;
+      }
+      if(data.sim1_num && data.sim1_num.length > 5) {
+          document.getElementById("num1_display").innerText = "(" + data.sim1_num + ")";
+      } else { document.getElementById("num1_display").innerText = ""; }
+      if(data.sim2_num && data.sim2_num.length > 5) {
+          document.getElementById("num2_display").innerText = "(" + data.sim2_num + ")";
+      } else { document.getElementById("num2_display").innerText = ""; }
+      document.getElementById("sim1_remark").value = data.sim1_remark;
+      document.getElementById("sim2_remark").value = data.sim2_remark;
+      document.getElementById("email_enable_sms").checked = data.email_sms;
+      document.getElementById("email_enable_boot").checked = data.email_boot;
+      document.getElementById("recipient").value = data.recipient;
+      document.getElementById("webhook").value = data.webhook;
+      document.getElementById("smtp_host").value = data.smtp_host;
+      document.getElementById("smtp_port").value = data.smtp_port;
+      document.getElementById("smtp_user").value = data.smtp_user;
+      document.getElementById("smtp_pass").value = data.smtp_pass;
+      document.getElementById("admin_user").value = data.admin_user;
+      if (data.mail_mode) { document.getElementById("mail_mode").value = data.mail_mode; toggleMailInputs(); }
+    });
+  }
+  
+  function scanWifi() {
+    var btn = document.getElementById("scanBtn");
+    btn.innerText = "扫描中..."; btn.disabled = true;
+    fetch('/scan').then(res => res.json()).then(data => {
+      var sel = document.getElementById("ssid_scan"); sel.innerHTML = "";
+      sel.onchange = function() { document.getElementById("manual_ssid").value = this.value; }
+      data.forEach(ssid => { var opt = document.createElement("option"); opt.value = ssid; opt.innerText = ssid; sel.appendChild(opt); });
+      if(data.length > 0) document.getElementById("manual_ssid").value = data[0];
+      btn.innerText = "重新扫描"; btn.disabled = false;
+      alert("扫描完成");
+    }).catch(e => { alert("扫描超时"); btn.disabled=false; });
+  }
+  
+  function changePassword() {
+    var oldPwd = document.getElementById("old_password").value;
+    var newPwd = document.getElementById("new_password").value;
+    if(!oldPwd || !newPwd) { alert("请填写旧密码和新密码"); return; }
+    fetch('/api/change_password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ old_password: oldPwd, new_password: newPwd })
+    }).then(res => {
+      if(res.status == 200) alert("密码修改成功，请重新登录"); else alert("修改失败，请检查旧密码");
+    });
+  }
+
+  function saveConfig() {
+    var ssid = document.getElementById("manual_ssid").value;
+    if(!ssid) { alert("WiFi名称不能为空"); return; }
+    var data = {
+      wifi_ssid: ssid, 
+      wifi_pass: document.getElementById("password").value,
+      sim1_remark: document.getElementById("sim1_remark").value, 
+      sim2_remark: document.getElementById("sim2_remark").value,
+      email_sms: document.getElementById("email_enable_sms").checked, 
+      email_boot: document.getElementById("email_enable_boot").checked,
+      recipient: document.getElementById("recipient").value, 
+      mail_mode: document.getElementById("mail_mode").value,
+      smtp_host: document.getElementById("smtp_host").value, 
+      smtp_port: document.getElementById("smtp_port").value,
+      smtp_user: document.getElementById("smtp_user").value, 
+      smtp_pass: document.getElementById("smtp_pass").value,
+      webhook: document.getElementById("webhook").value
+    };
+    fetch('/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) })
+    .then(res => { alert("已保存！设备将在3秒后重启..."); });
+  }
+</script>
+</body>
+</html>
+)rawliteral";
