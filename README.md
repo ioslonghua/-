@@ -1,6 +1,6 @@
 # -我的自用
 
-I love :coffee: :beer:,and:dancer:.
+I love :coffee: :beer:,and:dancer:./n
 1.硬件连接
 。模块1: TX>GPIO20,RX->GPI021,EN->GPI05
 模块2:TX->GPI016,RX->GPI017,。EN->GPI06
