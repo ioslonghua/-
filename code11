@@ -1,0 +1,802 @@
+/**
+ * 双卡短信转发器 - 最终稳定版
+ * 功能：
+ * - 双卡独立接收/发送短信（PDU模式，支持中文）
+ * - 长短信合并（每卡独立缓存，超时30秒）
+ * - 邮件通知（SMTP）
+ * - 管理员短信命令（SMS:号码:内容、RESET）
+ * - Web管理界面（配置双卡备注、邮件、Web账号；工具箱支持发送短信、Ping测试、模组信息查询）
+ * - 模组信息查询：ATI（固件）、CESQ（信号）、CIMI/ICCID/CNUM（SIM）、CEREG/COPS（网络）、WiFi状态
+ * - 网络Ping测试（使用AT+MPING）
+ * 硬件：ESP32 + 2 x ML307R-DC（或其他AT兼容模组）
+ * 引脚：模块1 UART0 (RX=4, TX=3)，模块2 UART1 (RX=17, TX=16)
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <pdulib.h>
+#define ENABLE_SMTP
+#define ENABLE_DEBUG
+#include <ReadyMail.h>
+#include <HTTPClient.h>
+#include <mbedtls/md.h>
+#include <base64.h>
+
+// ==================== 硬件引脚配置 ====================
+#define MODEM1_RXD   4
+#define MODEM1_TXD   3
+#define MODEM2_RXD   17
+#define MODEM2_TXD   16
+
+// ==================== WiFi 配置（可改为从Web配置） ====================
+#define WIFI_SSID "your_wifi_ssid"
+#define WIFI_PASS "your_wifi_password"
+
+// ==================== 全局配置 ====================
+Preferences preferences;
+
+// 推送类型（本版仅保留邮件，HTTP推送可后续扩展）
+struct Config {
+  String smtpServer;
+  int smtpPort;
+  String smtpUser;
+  String smtpPass;
+  String smtpSendTo;
+  String sim1Remark;
+  String sim2Remark;
+  String adminPhone;     // 管理员手机号（用于识别命令）
+  String webUser;
+  String webPass;
+};
+
+#define DEFAULT_WEB_USER "admin"
+#define DEFAULT_WEB_PASS "admin123"
+
+Config config;
+WiFiMulti WiFiMulti;
+WebServer server(80);
+
+// 两个模组的串口对象
+HardwareSerial SerialModem1(0);  // UART0
+HardwareSerial SerialModem2(1);  // UART1
+
+// 两个PDU解析对象
+PDU pdu1(4096);
+PDU pdu2(4096);
+
+// 长短信缓存
+#define MAX_CONCAT_PARTS   10
+#define CONCAT_TIMEOUT_MS  30000
+#define MAX_CONCAT_GROUPS  5
+
+struct SmsPart {
+  bool valid;
+  String text;
+};
+
+struct ConcatSms {
+  bool inUse;
+  int refNumber;
+  String sender;
+  String timestamp;
+  int totalParts;
+  int receivedParts;
+  unsigned long firstPartTime;
+  SmsPart parts[MAX_CONCAT_PARTS];
+};
+
+ConcatSms concatBuffer1[MAX_CONCAT_GROUPS];
+ConcatSms concatBuffer2[MAX_CONCAT_GROUPS];
+
+// 每张卡独立的状态机（0=idle, 1=wait_pdu）
+static int modem1State = 0;
+static int modem2State = 0;
+
+// 函数声明
+void loadConfig();
+void saveConfig();
+bool isConfigValid();
+String getDeviceUrl();
+void initConcatBuffer(ConcatSms* buffer);
+int findOrCreateConcatSlot(ConcatSms* buffer, int refNumber, const char* sender, int totalParts);
+String assembleConcatSms(ConcatSms* buffer, int slot);
+void clearConcatSlot(ConcatSms* buffer, int slot);
+void checkConcatTimeout(ConcatSms* buffer, int slotCount, int simSlot);
+void sendEmailNotification(const char* subject, const char* body);
+void processSmsContent(int simSlot, const char* sender, const char* text, const char* timestamp);
+bool sendSMS(HardwareSerial& modem, PDU& pdu, const char* phoneNumber, const char* message);
+bool isAdmin(const char* sender);
+void processAdminCommand(const char* sender, const char* text);
+void resetModule(HardwareSerial& modem);
+bool sendATandWaitOK(HardwareSerial& modem, const char* cmd, unsigned long timeout);
+String sendATCommand(HardwareSerial& modem, const char* cmd, unsigned long timeout);
+void initModem(HardwareSerial& modem, PDU& pdu, int slot);
+void checkModemURC(HardwareSerial& modem, PDU& pdu, ConcatSms* concatBuffer, int& state, int simSlot);
+String readSerialLine(HardwareSerial& port);
+bool isHexString(const String& str);
+void handleRoot();
+void handleToolsPage();
+void handleSave();
+void handleSendSms();
+void handlePing();
+void handleQuery();
+bool checkAuth();
+void setupWebServer();
+String urlEncode(const String& str);
+String jsonEscape(const String& str);
+String dingtalkSign(const String& secret, long timestamp);
+
+// ==================== 配置管理 ====================
+void loadConfig() {
+  preferences.begin("sms_config", true);
+  config.smtpServer = preferences.getString("smtpServer", "");
+  config.smtpPort = preferences.getInt("smtpPort", 465);
+  config.smtpUser = preferences.getString("smtpUser", "");
+  config.smtpPass = preferences.getString("smtpPass", "");
+  config.smtpSendTo = preferences.getString("smtpSendTo", "");
+  config.sim1Remark = preferences.getString("sim1Remark", "卡1");
+  config.sim2Remark = preferences.getString("sim2Remark", "卡2");
+  config.adminPhone = preferences.getString("adminPhone", "");
+  config.webUser = preferences.getString("webUser", DEFAULT_WEB_USER);
+  config.webPass = preferences.getString("webPass", DEFAULT_WEB_PASS);
+  preferences.end();
+  Serial.println("配置已加载");
+}
+
+void saveConfig() {
+  preferences.begin("sms_config", false);
+  preferences.putString("smtpServer", config.smtpServer);
+  preferences.putInt("smtpPort", config.smtpPort);
+  preferences.putString("smtpUser", config.smtpUser);
+  preferences.putString("smtpPass", config.smtpPass);
+  preferences.putString("smtpSendTo", config.smtpSendTo);
+  preferences.putString("sim1Remark", config.sim1Remark);
+  preferences.putString("sim2Remark", config.sim2Remark);
+  preferences.putString("adminPhone", config.adminPhone);
+  preferences.putString("webUser", config.webUser);
+  preferences.putString("webPass", config.webPass);
+  preferences.end();
+  Serial.println("配置已保存");
+}
+
+bool isConfigValid() {
+  return config.smtpServer.length() && config.smtpUser.length() && config.smtpPass.length() && config.smtpSendTo.length();
+}
+
+String getDeviceUrl() {
+  return "http://" + WiFi.localIP().toString() + "/";
+}
+
+// ==================== 长短信缓存管理 ====================
+void initConcatBuffer(ConcatSms* buffer) {
+  for (int i = 0; i < MAX_CONCAT_GROUPS; i++) {
+    buffer[i].inUse = false;
+    buffer[i].receivedParts = 0;
+    for (int j = 0; j < MAX_CONCAT_PARTS; j++) {
+      buffer[i].parts[j].valid = false;
+      buffer[i].parts[j].text = "";
+    }
+  }
+}
+
+int findOrCreateConcatSlot(ConcatSms* buffer, int refNumber, const char* sender, int totalParts) {
+  for (int i = 0; i < MAX_CONCAT_GROUPS; i++) {
+    if (buffer[i].inUse && buffer[i].refNumber == refNumber && buffer[i].sender.equals(sender))
+      return i;
+  }
+  for (int i = 0; i < MAX_CONCAT_GROUPS; i++) {
+    if (!buffer[i].inUse) {
+      buffer[i].inUse = true;
+      buffer[i].refNumber = refNumber;
+      buffer[i].sender = String(sender);
+      buffer[i].totalParts = totalParts;
+      buffer[i].receivedParts = 0;
+      buffer[i].firstPartTime = millis();
+      for (int j = 0; j < MAX_CONCAT_PARTS; j++) {
+        buffer[i].parts[j].valid = false;
+        buffer[i].parts[j].text = "";
+      }
+      return i;
+    }
+  }
+  int oldest = 0;
+  unsigned long oldestTime = buffer[0].firstPartTime;
+  for (int i = 1; i < MAX_CONCAT_GROUPS; i++) {
+    if (buffer[i].firstPartTime < oldestTime) {
+      oldestTime = buffer[i].firstPartTime;
+      oldest = i;
+    }
+  }
+  buffer[oldest].inUse = true;
+  buffer[oldest].refNumber = refNumber;
+  buffer[oldest].sender = String(sender);
+  buffer[oldest].totalParts = totalParts;
+  buffer[oldest].receivedParts = 0;
+  buffer[oldest].firstPartTime = millis();
+  for (int j = 0; j < MAX_CONCAT_PARTS; j++) {
+    buffer[oldest].parts[j].valid = false;
+    buffer[oldest].parts[j].text = "";
+  }
+  return oldest;
+}
+
+String assembleConcatSms(ConcatSms* buffer, int slot) {
+  String result = "";
+  for (int i = 0; i < buffer[slot].totalParts; i++) {
+    if (buffer[slot].parts[i].valid)
+      result += buffer[slot].parts[i].text;
+    else
+      result += "[缺失分段" + String(i+1) + "]";
+  }
+  return result;
+}
+
+void clearConcatSlot(ConcatSms* buffer, int slot) {
+  buffer[slot].inUse = false;
+  buffer[slot].receivedParts = 0;
+  buffer[slot].sender = "";
+  buffer[slot].timestamp = "";
+  for (int j = 0; j < MAX_CONCAT_PARTS; j++) {
+    buffer[slot].parts[j].valid = false;
+    buffer[slot].parts[j].text = "";
+  }
+}
+
+void checkConcatTimeout(ConcatSms* buffer, int slotCount, int simSlot) {
+  unsigned long now = millis();
+  for (int i = 0; i < slotCount; i++) {
+    if (buffer[i].inUse && (now - buffer[i].firstPartTime) >= CONCAT_TIMEOUT_MS) {
+      Serial.printf("卡%d 长短信超时，强制转发\n", simSlot);
+      String fullText = assembleConcatSms(buffer, i);
+      processSmsContent(simSlot, buffer[i].sender.c_str(), fullText.c_str(), buffer[i].timestamp.c_str());
+      clearConcatSlot(buffer, i);
+    }
+  }
+}
+
+// ==================== 邮件通知 ====================
+WiFiClientSecure ssl_client;
+SMTPClient smtp(ssl_client);
+
+void sendEmailNotification(const char* subject, const char* body) {
+  if (!isConfigValid()) {
+    Serial.println("邮件配置无效，跳过发送");
+    return;
+  }
+  auto cb = [](SMTPStatus status) { Serial.println(status.text); };
+  smtp.connect(config.smtpServer.c_str(), config.smtpPort, cb);
+  if (smtp.isConnected()) {
+    smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password);
+    SMTPMessage msg;
+    String from = "SMS <" + config.smtpUser + ">";
+    msg.headers.add(rfc822_from, from.c_str());
+    String to = "User <" + config.smtpSendTo + ">";
+    msg.headers.add(rfc822_to, to.c_str());
+    msg.headers.add(rfc822_subject, subject);
+    msg.text.body(body);
+    configTime(0, 0, "ntp.aliyun.com");
+    // 简单等待时间同步（最多5秒）
+    unsigned long start = millis();
+    while (time(nullptr) < 100000 && millis() - start < 5000) delay(100);
+    msg.timestamp = time(nullptr);
+    smtp.send(msg);
+    Serial.println("邮件已发送");
+  } else {
+    Serial.println("邮件服务器连接失败");
+  }
+}
+
+// ==================== 短信发送 ====================
+bool sendSMS(HardwareSerial& modem, PDU& pdu, const char* phoneNumber, const char* message) {
+  Serial.printf("发送短信 -> %s : %s\n", phoneNumber, message);
+  pdu.setSCAnumber();
+  int pduLen = pdu.encodePDU(phoneNumber, message);
+  if (pduLen < 0) {
+    Serial.printf("PDU编码失败: %d\n", pduLen);
+    return false;
+  }
+  String pduStr = pdu.getSMS();
+  Serial.println("PDU: " + pduStr);
+  
+  while (modem.available()) modem.read();
+  modem.printf("AT+CMGS=%d\r\n", pduLen);
+  unsigned long start = millis();
+  bool gotPrompt = false;
+  while (millis() - start < 5000) {
+    if (modem.available()) {
+      char c = modem.read();
+      if (c == '>') { gotPrompt = true; break; }
+    }
+  }
+  if (!gotPrompt) { Serial.println("未收到>"); return false; }
+  
+  modem.print(pduStr);
+  modem.write(0x1A); // Ctrl+Z
+  
+  start = millis();
+  String resp = "";
+  while (millis() - start < 30000) {
+    while (modem.available()) {
+      char c = modem.read();
+      resp += c;
+      if (resp.indexOf("OK") >= 0) { Serial.println("发送成功"); return true; }
+      if (resp.indexOf("ERROR") >= 0) { Serial.println("发送失败"); return false; }
+    }
+  }
+  Serial.println("超时");
+  return false;
+}
+
+// ==================== 管理员命令 ====================
+bool isAdmin(const char* sender) {
+  if (config.adminPhone.length() == 0) return false;
+  String s = String(sender);
+  String a = config.adminPhone;
+  if (s.startsWith("+86")) s = s.substring(3);
+  if (a.startsWith("+86")) a = a.substring(3);
+  return s == a;
+}
+
+void processAdminCommand(const char* sender, const char* text) {
+  String cmd = String(text);
+  cmd.trim();
+  Serial.println("处理管理员命令: " + cmd);
+  
+  if (cmd.startsWith("SMS:")) {
+    int first = cmd.indexOf(':');
+    int second = cmd.indexOf(':', first+1);
+    if (second > first+1) {
+      String target = cmd.substring(first+1, second);
+      String msg = cmd.substring(second+1);
+      target.trim(); msg.trim();
+      // 默认使用卡1发送
+      bool ok = sendSMS(SerialModem1, pdu1, target.c_str(), msg.c_str());
+      String result = ok ? "成功" : "失败";
+      sendEmailNotification("短信发送结果", "目标: " + target + "\n结果: " + result);
+    }
+  } else if (cmd.equals("RESET")) {
+    sendEmailNotification("重启命令", "设备即将重启");
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+// ==================== 短信内容最终处理 ====================
+void processSmsContent(int simSlot, const char* sender, const char* text, const char* timestamp) {
+  Serial.printf("卡%d 收到短信: %s -> %s (%s)\n", simSlot, sender, text, timestamp);
+  
+  if (isAdmin(sender)) {
+    processAdminCommand(sender, text);
+    return;
+  }
+  
+  String simRemark = (simSlot == 1) ? config.sim1Remark : config.sim2Remark;
+  String subject = "短信(" + simRemark + ")来自" + String(sender);
+  String body = "卡槽: " + simRemark + "\n发送者: " + sender + "\n时间: " + timestamp + "\n内容:\n" + text;
+  sendEmailNotification(subject.c_str(), body.c_str());
+}
+
+// ==================== AT指令辅助 ====================
+bool sendATandWaitOK(HardwareSerial& modem, const char* cmd, unsigned long timeout) {
+  while (modem.available()) modem.read();
+  modem.println(cmd);
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    if (modem.available()) {
+      String resp = modem.readStringUntil('\n');
+      if (resp.indexOf("OK") >= 0) return true;
+      if (resp.indexOf("ERROR") >= 0) return false;
+    }
+  }
+  return false;
+}
+
+String sendATCommand(HardwareSerial& modem, const char* cmd, unsigned long timeout) {
+  while (modem.available()) modem.read();
+  modem.println(cmd);
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeout) {
+    while (modem.available()) {
+      char c = modem.read();
+      resp += c;
+      if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
+        delay(50);
+        while (modem.available()) resp += (char)modem.read();
+        return resp;
+      }
+    }
+  }
+  return resp;
+}
+
+// ==================== 模组初始化 ====================
+void initModem(HardwareSerial& modem, PDU& pdu, int slot) {
+  Serial.printf("初始化卡%d模组...\n", slot);
+  while (!sendATandWaitOK(modem, "AT", 1000)) {
+    Serial.printf("卡%d AT无响应，重试...\n", slot);
+    delay(1000);
+  }
+  sendATandWaitOK(modem, "AT+CMGF=0", 1000);      // PDU模式
+  sendATandWaitOK(modem, "AT+CNMI=2,2,0,0,0", 1000); // 直接上报PDU
+  Serial.printf("卡%d 初始化完成\n", slot);
+}
+
+// ==================== URC处理（带独立状态机） ====================
+String readSerialLine(HardwareSerial& port) {
+  static char buf[512];
+  static int pos = 0;
+  while (port.available()) {
+    char c = port.read();
+    if (c == '\n') {
+      buf[pos] = 0;
+      String line = String(buf);
+      pos = 0;
+      return line;
+    } else if (c != '\r') {
+      if (pos < 511) buf[pos++] = c;
+    }
+  }
+  return "";
+}
+
+bool isHexString(const String& str) {
+  if (str.length() == 0) return false;
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+      return false;
+  }
+  return true;
+}
+
+void checkModemURC(HardwareSerial& modem, PDU& pdu, ConcatSms* concatBuffer, int& state, int simSlot) {
+  String line = readSerialLine(modem);
+  if (line.length() == 0) return;
+  Serial.printf("[卡%d] %s\n", simSlot, line.c_str());
+  
+  if (state == 0) {
+    if (line.startsWith("+CMT:")) {
+      state = 1;
+    }
+  } else if (state == 1) {
+    if (line.length() == 0) return;
+    if (isHexString(line)) {
+      Serial.printf("PDU数据: %s\n", line.c_str());
+      if (!pdu.decodePDU(line.c_str())) {
+        Serial.println("PDU解析失败");
+      } else {
+        int* concatInfo = pdu.getConcatInfo();
+        int ref = concatInfo[0], part = concatInfo[1], total = concatInfo[2];
+        if (total > 1 && part > 0) {
+          int slot = findOrCreateConcatSlot(concatBuffer, ref, pdu.getSender(), total);
+          int idx = part - 1;
+          if (idx >= 0 && idx < MAX_CONCAT_PARTS && !concatBuffer[slot].parts[idx].valid) {
+            concatBuffer[slot].parts[idx].valid = true;
+            concatBuffer[slot].parts[idx].text = String(pdu.getText());
+            concatBuffer[slot].receivedParts++;
+            if (concatBuffer[slot].receivedParts == 1)
+              concatBuffer[slot].timestamp = String(pdu.getTimeStamp());
+            if (concatBuffer[slot].receivedParts >= total) {
+              String full = assembleConcatSms(concatBuffer, slot);
+              processSmsContent(simSlot, concatBuffer[slot].sender.c_str(), full.c_str(), concatBuffer[slot].timestamp.c_str());
+              clearConcatSlot(concatBuffer, slot);
+            }
+          }
+        } else {
+          processSmsContent(simSlot, pdu.getSender(), pdu.getText(), pdu.getTimeStamp());
+        }
+      }
+      state = 0;
+    } else {
+      state = 0; // 非PDU数据，退出等待
+    }
+  }
+}
+
+// ==================== 工具箱辅助函数 ====================
+String urlEncode(const String& str) {
+  String encoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (c == ' ') encoded += '+';
+    else if (isalnum(c)) encoded += c;
+    else {
+      char hex[4];
+      sprintf(hex, "%%%02X", (unsigned char)c);
+      encoded += hex;
+    }
+  }
+  return encoded;
+}
+
+String jsonEscape(const String& str) {
+  String out = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (c == '"') out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else out += c;
+  }
+  return out;
+}
+
+String dingtalkSign(const String& secret, long timestamp) {
+  String stringToSign = String(timestamp) + "\n" + secret;
+  uint8_t hmacResult[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)secret.c_str(), secret.length());
+  mbedtls_md_hmac_update(&ctx, (const unsigned char*)stringToSign.c_str(), stringToSign.length());
+  mbedtls_md_hmac_finish(&ctx, hmacResult);
+  mbedtls_md_free(&ctx);
+  return urlEncode(base64::encode(hmacResult, 32));
+}
+
+// ==================== Web 服务器 ====================
+bool checkAuth() {
+  if (!server.authenticate(config.webUser.c_str(), config.webPass.c_str())) {
+    server.requestAuthentication(BASIC_AUTH, "Dual SIM SMS Forwarder", "Please login");
+    return false;
+  }
+  return true;
+}
+
+// 系统配置页面
+void handleRoot() {
+  if (!checkAuth()) return;
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>双卡短信转发器 - 配置</title><style>
+body { font-family: Arial; margin: 20px; }
+.container { max-width: 600px; margin: auto; background: #f9f9f9; padding: 20px; border-radius: 10px; }
+input, button { width: 100%; padding: 8px; margin: 5px 0; }
+.nav { display: flex; gap: 10px; margin-bottom: 20px; }
+.nav a { background: #ddd; padding: 10px; text-decoration: none; color: black; border-radius: 5px; }
+.nav a.active { background: #4CAF50; color: white; }
+</style>
+</head>
+<body>
+<div class="container">
+<div class="nav"><a href="/" class="active">系统配置</a><a href="/tools">工具箱</a></div>
+<h2>双卡短信转发器配置</h2>
+<form action="/save" method="POST">
+<h3>卡槽设置</h3>
+卡1备注: <input name="sim1Remark" value=")rawliteral" + config.sim1Remark + R"rawliteral("><br>
+卡2备注: <input name="sim2Remark" value=")rawliteral" + config.sim2Remark + R"rawliteral("><br>
+<h3>邮件通知</h3>
+SMTP服务器: <input name="smtpServer" value=")rawliteral" + config.smtpServer + R"rawliteral("><br>
+端口: <input name="smtpPort" value=")rawliteral" + String(config.smtpPort) + R"rawliteral("><br>
+邮箱账号: <input name="smtpUser" value=")rawliteral" + config.smtpUser + R"rawliteral("><br>
+邮箱密码/授权码: <input type="password" name="smtpPass" value=")rawliteral" + config.smtpPass + R"rawliteral("><br>
+接收邮箱: <input name="smtpSendTo" value=")rawliteral" + config.smtpSendTo + R"rawliteral("><br>
+<h3>管理员设置</h3>
+管理员手机号: <input name="adminPhone" value=")rawliteral" + config.adminPhone + R"rawliteral("><br>
+Web账号: <input name="webUser" value=")rawliteral" + config.webUser + R"rawliteral("><br>
+Web密码: <input type="password" name="webPass" value=")rawliteral" + config.webPass + R"rawliteral("><br>
+<input type="submit" value="保存配置并重启">
+</form>
+</div>
+</body>
+</html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+// 工具箱页面
+void handleToolsPage() {
+  if (!checkAuth()) return;
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>工具箱</title><style>
+body { font-family: Arial; margin: 20px; }
+.container { max-width: 600px; margin: auto; background: #f9f9f9; padding: 20px; border-radius: 10px; }
+input, textarea, button { width: 100%; padding: 8px; margin: 5px 0; }
+.nav { display: flex; gap: 10px; margin-bottom: 20px; }
+.nav a { background: #ddd; padding: 10px; text-decoration: none; color: black; border-radius: 5px; }
+.nav a.active { background: #4CAF50; color: white; }
+.result { margin-top: 10px; padding: 10px; border-radius: 5px; background: #e7f3fe; display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+<div class="nav"><a href="/">系统配置</a><a href="/tools" class="active">工具箱</a></div>
+<h2>工具箱</h2>
+<h3>发送短信</h3>
+<form action="/sendsms" method="POST">
+选择卡槽: <select name="simSlot"><option value="1">卡1</option><option value="2">卡2</option></select>
+目标号码: <input name="phone" placeholder="13800138000">
+短信内容: <textarea name="content" rows="3" placeholder="支持中文"></textarea>
+<input type="submit" value="发送短信">
+</form>
+<hr>
+<button onclick="doPing()">📡 Ping测试 (8.8.8.8)</button>
+<div id="pingResult" class="result"></div>
+<hr>
+<button onclick="queryInfo('ati')">📋 固件信息</button>
+<button onclick="queryInfo('signal')">📶 信号质量</button>
+<button onclick="queryInfo('siminfo')">💳 SIM卡信息</button>
+<button onclick="queryInfo('network')">🌍 网络状态</button>
+<button onclick="queryInfo('wifi')">📡 WiFi状态</button>
+<div id="queryResult" class="result"></div>
+</div>
+<script>
+function doPing() {
+  var btn = event.target;
+  var resultDiv = document.getElementById('pingResult');
+  btn.disabled = true; resultDiv.style.display = 'block'; resultDiv.innerHTML = '正在Ping，请稍候...';
+  fetch('/ping', {method:'POST'})
+    .then(r => r.json())
+    .then(data => {
+      resultDiv.innerHTML = data.success ? '✅ ' + data.message : '❌ ' + data.message;
+      btn.disabled = false;
+    })
+    .catch(e => { resultDiv.innerHTML = '请求失败'; btn.disabled = false; });
+}
+function queryInfo(type) {
+  var resultDiv = document.getElementById('queryResult');
+  resultDiv.style.display = 'block'; resultDiv.innerHTML = '查询中...';
+  fetch('/query?type=' + type)
+    .then(r => r.json())
+    .then(data => {
+      resultDiv.innerHTML = data.success ? data.message : '❌ 查询失败: ' + data.message;
+    })
+    .catch(e => { resultDiv.innerHTML = '请求失败'; });
+}
+</script>
+</body>
+</html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleSave() {
+  if (!checkAuth()) return;
+  config.sim1Remark = server.arg("sim1Remark");
+  config.sim2Remark = server.arg("sim2Remark");
+  config.smtpServer = server.arg("smtpServer");
+  config.smtpPort = server.arg("smtpPort").toInt();
+  config.smtpUser = server.arg("smtpUser");
+  config.smtpPass = server.arg("smtpPass");
+  config.smtpSendTo = server.arg("smtpSendTo");
+  config.adminPhone = server.arg("adminPhone");
+  config.webUser = server.arg("webUser");
+  config.webPass = server.arg("webPass");
+  saveConfig();
+  server.send(200, "text/html", "<html><body>保存成功，3秒后重启<script>setTimeout(function(){location.href='/';},3000);</script></body></html>");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleSendSms() {
+  if (!checkAuth()) return;
+  int slot = server.arg("simSlot").toInt();
+  String phone = server.arg("phone");
+  String content = server.arg("content");
+  bool ok = false;
+  if (slot == 1) ok = sendSMS(SerialModem1, pdu1, phone.c_str(), content.c_str());
+  else ok = sendSMS(SerialModem2, pdu2, phone.c_str(), content.c_str());
+  server.send(200, "text/html", ok ? "<html>发送成功</html>" : "<html>发送失败</html>");
+}
+
+void handlePing() {
+  if (!checkAuth()) return;
+  // 使用卡1进行Ping测试
+  while (SerialModem1.available()) SerialModem1.read();
+  SerialModem1.println("AT+CGACT=1,1");
+  delay(2000);
+  SerialModem1.println("AT+MPING=\"8.8.8.8\",30,1");
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < 35000) {
+    if (SerialModem1.available()) resp += (char)SerialModem1.read();
+    if (resp.indexOf("+MPING:") >= 0) break;
+  }
+  SerialModem1.println("AT+CGACT=0,1");
+  bool success = (resp.indexOf("+MPING:") >= 0 && (resp.indexOf("OK") >= 0 || resp.indexOf("1")>0));
+  String result = success ? "Ping成功" : "Ping失败";
+  server.send(200, "application/json", "{\"success\":" + String(success) + ",\"message\":\"" + result + "\"}");
+}
+
+void handleQuery() {
+  if (!checkAuth()) return;
+  String type = server.arg("type");
+  String message = "";
+  bool success = false;
+  
+  if (type == "ati") {
+    String resp = sendATCommand(SerialModem1, "ATI", 3000);
+    if (resp.indexOf("OK") >= 0) {
+      success = true;
+      message = "<pre>" + resp + "</pre>";
+    } else message = "查询失败";
+  }
+  else if (type == "signal") {
+    String resp = sendATCommand(SerialModem1, "AT+CESQ", 3000);
+    if (resp.indexOf("+CESQ:") >= 0) {
+      success = true;
+      message = "<pre>" + resp + "</pre>";
+    } else message = "查询失败";
+  }
+  else if (type == "siminfo") {
+    String imsi = sendATCommand(SerialModem1, "AT+CIMI", 3000);
+    String iccid = sendATCommand(SerialModem1, "AT+ICCID", 3000);
+    String cnum = sendATCommand(SerialModem1, "AT+CNUM", 3000);
+    success = true;
+    message = "<pre>IMSI: " + imsi + "\nICCID: " + iccid + "\nCNUM: " + cnum + "</pre>";
+  }
+  else if (type == "network") {
+    String cereg = sendATCommand(SerialModem1, "AT+CEREG?", 3000);
+    String cops = sendATCommand(SerialModem1, "AT+COPS?", 3000);
+    success = true;
+    message = "<pre>注册状态: " + cereg + "\n运营商: " + cops + "</pre>";
+  }
+  else if (type == "wifi") {
+    String info = "SSID: " + WiFi.SSID() + "\n";
+    info += "IP: " + WiFi.localIP().toString() + "\n";
+    info += "RSSI: " + String(WiFi.RSSI()) + " dBm\n";
+    info += "MAC: " + WiFi.macAddress();
+    success = true;
+    message = "<pre>" + info + "</pre>";
+  }
+  else {
+    message = "未知查询类型";
+  }
+  
+  String json = "{\"success\":" + String(success) + ",\"message\":\"" + jsonEscape(message) + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/tools", handleToolsPage);
+  server.on("/sendsms", HTTP_POST, handleSendSms);
+  server.on("/ping", HTTP_POST, handlePing);
+  server.on("/query", handleQuery);
+  server.begin();
+  Serial.println("Web服务器已启动");
+}
+
+// ==================== 主程序 ====================
+void setup() {
+  Serial.begin(115200);
+  SerialModem1.begin(115200, SERIAL_8N1, MODEM1_RXD, MODEM1_TXD);
+  SerialModem2.begin(115200, SERIAL_8N1, MODEM2_RXD, MODEM2_TXD);
+  
+  loadConfig();
+  initConcatBuffer(concatBuffer1);
+  initConcatBuffer(concatBuffer2);
+  
+  WiFiMulti.addAP(WIFI_SSID, WIFI_PASS);
+  Serial.println("连接WiFi");
+  while (WiFiMulti.run() != WL_CONNECTED) delay(500);
+  Serial.println("WiFi已连接 IP: " + WiFi.localIP().toString());
+  
+  setupWebServer();
+  
+  initModem(SerialModem1, pdu1, 1);
+  initModem(SerialModem2, pdu2, 2);
+  
+  if (isConfigValid()) {
+    sendEmailNotification("双卡短信转发器启动", "设备已启动\n地址: " + getDeviceUrl());
+  }
+}
+
+void loop() {
+  server.handleClient();
+  checkModemURC(SerialModem1, pdu1, concatBuffer1, modem1State, 1);
+  checkModemURC(SerialModem2, pdu2, concatBuffer2, modem2State, 2);
+  checkConcatTimeout(concatBuffer1, MAX_CONCAT_GROUPS, 1);
+  checkConcatTimeout(concatBuffer2, MAX_CONCAT_GROUPS, 2);
+  // 可选串口透传（调试用）
+  // if (Serial.available()) SerialModem1.write(Serial.read());
+}
